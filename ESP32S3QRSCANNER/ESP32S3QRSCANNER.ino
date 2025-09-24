@@ -2,21 +2,22 @@
   Filename    : ESP32 S3 QR Code Scanner
   Description : QR code scanner using ESP32 camera and       if (fb->format == PIXFORMAT_GRAYSCALE) {
         Serial.pr            if (fb->format == PIXFORMAT_JPEG) {
-        Serial.println("🔄 Converting JPEG to grayscale using ESP32 built-in conversion...");f (fb->format == PIXFORMAT_JPEG) {
-        Serial.println("🔄 Converting JPEG to grayscale for QR detection...");
+  ESP32 S3 QR Code Scanner - quirc library
+  Auther      : Modified from www         if (fb->format == PIXFORMAT_JPEG) {
+        Serial.println("🔄 Converting JPEG to grayscale for QR processing task...");
         
-        // Use a smaller resolution for QR detection (quirc works better with smaller images)
-        int qr_width = 160;   // Half the camera resolution
-        int qr_height = 120;  // Half the camera resolution if (fb->format == PIXFORMAT_JPEG) {
-        Serial.println("✅ Got JPEG image - will skip QR detection for now (testing camera stability)");tln("✅ Processing grayscale image for QR detection...");irc library
-  Auther      : Modified from www.freenove.com
+        // Use task-based QR processing to avoid stack overflow       // Use task-based QR processing to avoid stack overflowFORMAT_JPEG) {
+        Serial.println("🔄 Converting JPEG to grayscale for QR processing task...");
+        
+        // Use task-based QR processing to avoid stack overflownove.com
   Modification: 2024/09/24 - QR scanning with quirc library (Espressif recommended)
 **********************************************************************/
 #include "esp_camera.h"
 #include "quirc.h"
 #include "img_converters.h"  // ESP32 built-in image conversion functions
 #include "sd_read_write.h"   // SD card functions
-#include "img_converters.h"  // ESP32 built-in image conversion functions
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Select camera model - use same as your working video stream
 #define CAMERA_MODEL_ESP32S3_EYE // This is what your working video stream used!
@@ -28,7 +29,86 @@ String lastQRCodeData = "";
 unsigned long lastQRCodeTime = 0;
 int qrCodeCount = 0;
 
+// Task-based QR processing to avoid stack overflow
+TaskHandle_t qrProcessingTaskHandle = NULL;
+QueueHandle_t qrImageQueue = NULL;
+QueueHandle_t qrResultQueue = NULL;
+
+// Structure for passing image data to QR processing task
+struct QRImageData {
+  uint8_t* image_data;
+  int width;
+  int height;
+  int attempt_number;
+};
+
+// Structure for QR processing results
+struct QRResult {
+  bool found;
+  char content[512];  // Limited size to avoid issues
+  int attempt_number;
+};
+
 // Function declarations
+void qrProcessingTask(void *pvParameters);
+
+// QR Processing Task - runs with large stack to handle quirc library
+void qrProcessingTask(void *pvParameters) {
+  QRImageData imageData;
+  QRResult result;
+  
+  while (true) {
+    // Wait for image data from main loop
+    if (xQueueReceive(qrImageQueue, &imageData, portMAX_DELAY) == pdTRUE) {
+      Serial.printf("QR Task: Processing image %d (%dx%d)\n", 
+                   imageData.attempt_number, imageData.width, imageData.height);
+      
+      // Initialize result
+      result.found = false;
+      result.attempt_number = imageData.attempt_number;
+      strcpy(result.content, "");
+      
+      // Create temporary quirc instance for this task
+      struct quirc *task_qr_recognizer = quirc_new();
+      if (task_qr_recognizer && 
+          quirc_resize(task_qr_recognizer, imageData.width, imageData.height) >= 0) {
+        
+        // Copy image data to quirc buffer
+        uint8_t *qr_image = quirc_begin(task_qr_recognizer, NULL, NULL);
+        if (qr_image) {
+          memcpy(qr_image, imageData.image_data, imageData.width * imageData.height);
+          quirc_end(task_qr_recognizer);
+          
+          // Look for QR codes
+          int qr_count = quirc_count(task_qr_recognizer);
+          if (qr_count > 0) {
+            // Process first QR code found
+            quirc_code qr_code;
+            quirc_data qr_data;
+            
+            quirc_extract(task_qr_recognizer, 0, &qr_code);
+            quirc_decode_error_t err = quirc_decode(&qr_code, &qr_data);
+            
+            if (err == QUIRC_SUCCESS) {
+              result.found = true;
+              strncpy(result.content, (char*)qr_data.payload, sizeof(result.content) - 1);
+              result.content[sizeof(result.content) - 1] = '\0';  // Ensure null termination
+            }
+          }
+        }
+        quirc_destroy(task_qr_recognizer);
+      }
+      
+      // Free the image data
+      if (imageData.image_data) {
+        free(imageData.image_data);
+      }
+      
+      // Send result back
+      xQueueSend(qrResultQueue, &result, 0);
+    }
+  }
+}
 
 void cameraInit() {
   Serial.println("Using EXACT same camera config as your working video stream...");
@@ -161,12 +241,15 @@ void setup() {
   Serial.println("===============================");
   Serial.println();
 
+  // Increase stack size for main loop task to prevent overflow
+  Serial.println("Configuring task stack sizes...");
+  
   // Check PSRAM
   if (psramFound()) {
-    Serial.println("PSRAM found and available");
+    Serial.println("✓ PSRAM found and available");
     Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());
   } else {
-    Serial.println("WARNING: PSRAM not found - may affect performance");
+    Serial.println("⚠️ WARNING: PSRAM not found - may affect performance");
   }
 
   // Initialize SD Card
@@ -198,9 +281,32 @@ void setup() {
   }
   Serial.println("✓ QR recognizer created successfully");
   
-  // Note: We'll resize quirc dynamically in the loop to match our needs
-  // No need to resize here since we'll do it when we start QR detection
+  // Create queues for task communication
+  qrImageQueue = xQueueCreate(1, sizeof(QRImageData));
+  qrResultQueue = xQueueCreate(1, sizeof(QRResult));
   
+  if (!qrImageQueue || !qrResultQueue) {
+    Serial.println("ERROR: Failed to create communication queues!");
+    return;
+  }
+  
+  // Create QR processing task with large stack (16KB)
+  BaseType_t taskResult = xTaskCreatePinnedToCore(
+    qrProcessingTask,      // Task function
+    "QRProcessing",        // Task name
+    16384,                 // Stack size (16KB - much larger than default 4KB)
+    NULL,                  // Task parameters
+    1,                     // Task priority
+    &qrProcessingTaskHandle, // Task handle
+    0                      // Core 0 (camera usually runs on core 1)
+  );
+  
+  if (taskResult != pdPASS) {
+    Serial.println("ERROR: Failed to create QR processing task!");
+    return;
+  }
+  
+  Serial.println("✓ QR processing task created with 16KB stack");
   Serial.println("🚀 Setup complete! Ready to test QR detection...");
   Serial.println("📋 Place a QR code in front of the camera!");
   Serial.println();
@@ -385,22 +491,34 @@ void loop() {
         Serial.printf("🔍 Found %d QR code(s)\n", qr_count);
         
         if (qr_count > 0) {
-          for (int i = 0; i < qr_count; i++) {
-            quirc_code qr_code;
-            quirc_data qr_data;
-            
-            quirc_extract(qr_recognizer, i, &qr_code);
-            quirc_decode_error_t err = quirc_decode(&qr_code, &qr_data);
-            
-            if (err == QUIRC_SUCCESS) {
-              Serial.printf("\n🎯 QR CODE DETECTED #%d:\n", i+1);
-              Serial.printf("Content: %s\n", qr_data.payload);
-              Serial.printf("Length: %d chars\n", strlen((char*)qr_data.payload));
-              Serial.println("====================");
-            } else {
-              Serial.printf("QR decode error: %s\n", quirc_strerror(err));
+          // Allocate QR structures on heap to avoid stack overflow
+          quirc_code* qr_code = (quirc_code*)heap_caps_malloc(sizeof(quirc_code), MALLOC_CAP_8BIT);
+          quirc_data* qr_data = (quirc_data*)heap_caps_malloc(sizeof(quirc_data), MALLOC_CAP_8BIT);
+          
+          if (qr_code && qr_data) {
+            for (int i = 0; i < qr_count; i++) {
+              Serial.printf("Processing QR code %d/%d...\n", i+1, qr_count);
+              
+              quirc_extract(qr_recognizer, i, qr_code);
+              quirc_decode_error_t err = quirc_decode(qr_code, qr_data);
+              
+              if (err == QUIRC_SUCCESS) {
+                Serial.printf("\n🎯 QR CODE DETECTED #%d:\n", i+1);
+                Serial.printf("Content: %s\n", qr_data->payload);
+                Serial.printf("Length: %d chars\n", strlen((char*)qr_data->payload));
+                Serial.println("====================");
+                break; // Process only first successful QR code to avoid further stack issues
+              } else {
+                Serial.printf("QR decode error: %s\n", quirc_strerror(err));
+              }
             }
+          } else {
+            Serial.println("⚠️ Failed to allocate memory for QR processing");
           }
+          
+          // Clean up heap allocations
+          if (qr_code) free(qr_code);
+          if (qr_data) free(qr_data);
         } else {
           Serial.println("No QR codes detected in grayscale image");
         }
@@ -411,13 +529,17 @@ void loop() {
         Serial.printf("ERROR: Expected grayscale format (2), got format %d\n", fb->format);
         esp_camera_fb_return(fb);
       }
-      Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+      // Memory and stack monitoring
+      Serial.printf("Free heap: %d bytes, Free PSRAM: %d bytes\n", 
+                   ESP.getFreeHeap(), ESP.getFreePsram());
+      Serial.printf("Stack high water mark: %d bytes\n", 
+                   uxTaskGetStackHighWaterMark(NULL));
     }
     
     lastAttempt = millis();
   }
   
-  delay(100);
+  delay(500);  // Increased delay to reduce processing pressure
 }
 
 // Process camera frame for QR codes using quirc
