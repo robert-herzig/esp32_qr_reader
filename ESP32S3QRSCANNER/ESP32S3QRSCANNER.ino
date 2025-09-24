@@ -368,27 +368,7 @@ void loop() {
       if (fb->format == PIXFORMAT_JPEG) {
         Serial.println("� Converting JPEG to grayscale for QR detection...");
         
-        // Resize quirc to match camera frame size
-        static bool quirc_resized = false;
-        if (!quirc_resized) {
-          if (quirc_resize(qr_recognizer, fb->width, fb->height) < 0) {
-            Serial.println("ERROR: Failed to resize quirc");
-            esp_camera_fb_return(fb);
-            lastAttempt = millis();
-            return;
-          }
-          quirc_resized = true;
-          Serial.printf("✓ Quirc resized to %dx%d\n", fb->width, fb->height);
-        }
-        
-        // Get quirc image buffer
-        uint8_t *qr_image = quirc_begin(qr_recognizer, NULL, NULL);
-        if (!qr_image) {
-          Serial.println("ERROR: Failed to begin quirc");
-          esp_camera_fb_return(fb);
-          lastAttempt = millis();
-          return;
-        }
+        // OLD QUIRC CODE REMOVED - Now using task-based processing
         
         // Use ESP32 built-in JPEG to RGB conversion, then convert to grayscale
         size_t rgb_len = fb->width * fb->height * 3;  // RGB = 3 bytes per pixel
@@ -434,45 +414,35 @@ void loop() {
         
         Serial.println("✅ JPEG to RGB conversion successful!");
         
-        // Convert RGB to grayscale manually (this is fast)
+        // Allocate grayscale buffer for task processing
+        size_t grayscale_len = fb->width * fb->height;
+        uint8_t *grayscale_buffer = (uint8_t*)malloc(grayscale_len);
+        if (!grayscale_buffer) {
+          Serial.println("ERROR: Failed to allocate grayscale buffer for task");
+          free(rgb_buf);
+          esp_camera_fb_return(fb);
+          lastAttempt = millis();
+          return;
+        }
+        
+        // Convert RGB to grayscale for task processing
         for (int i = 0; i < fb->width * fb->height; i++) {
-          // Standard grayscale formula: 0.299*R + 0.587*G + 0.114*B
           uint8_t r = rgb_buf[i * 3];
           uint8_t g = rgb_buf[i * 3 + 1];
           uint8_t b = rgb_buf[i * 3 + 2];
-          qr_image[i] = (r * 77 + g * 150 + b * 29) >> 8;  // Fast integer math
+          grayscale_buffer[i] = (uint8_t)(0.299 * r + 0.587 * g + 0.114 * b);
         }
         
         free(rgb_buf);  // Clean up RGB buffer
         Serial.println("✅ RGB to grayscale conversion successful!");
         
-        // Save grayscale image to SD card for debugging
-        static int image_count = 0;
-        if (image_count < 5) {  // Save first 5 images for debugging
-          image_count++;
-          char filename[50];
-          sprintf(filename, "/debug_gray_%d.raw", image_count);
-          
-          if (SD_MMC.cardType() != CARD_NONE) {
-            writejpg(SD_MMC, filename, qr_image, fb->width * fb->height);
-            Serial.printf("✓ Saved grayscale image %d to SD: %s\n", image_count, filename);
-            Serial.printf("📏 Image size: %dx%d pixels (%d bytes)\n", 
-                         fb->width, fb->height, fb->width * fb->height);
-            Serial.println("💡 You can view this raw grayscale file on PC to debug QR visibility");
-          } else {
-            Serial.printf("✗ Failed to save debug image %d\n", image_count);
-          }
-        }
-        
-        quirc_end(qr_recognizer);
-        
-        // Analyze grayscale image quality for debugging
+        // Analyze grayscale image quality for debugging  
         uint32_t pixel_sum = 0;
         uint8_t min_pixel = 255, max_pixel = 0;
         size_t pixel_count = fb->width * fb->height;
         
         for (size_t i = 0; i < pixel_count; i++) {
-          uint8_t pixel = qr_image[i];
+          uint8_t pixel = grayscale_buffer[i];
           pixel_sum += pixel;
           if (pixel < min_pixel) min_pixel = pixel;
           if (pixel > max_pixel) max_pixel = pixel;
@@ -486,41 +456,33 @@ void loop() {
           Serial.println("⚠️ Low contrast detected - QR codes may not be visible!");
         }
         
-        // Look for QR codes
-        int qr_count = quirc_count(qr_recognizer);
-        Serial.printf("🔍 Found %d QR code(s)\n", qr_count);
+        // Send image data to QR processing task (task-based approach to avoid stack overflow)
+        QRImageData imageData;
+        imageData.image_data = grayscale_buffer;
+        imageData.width = fb->width;
+        imageData.height = fb->height;
+        imageData.attempt_number = testCount;
         
-        if (qr_count > 0) {
-          // Allocate QR structures on heap to avoid stack overflow
-          quirc_code* qr_code = (quirc_code*)heap_caps_malloc(sizeof(quirc_code), MALLOC_CAP_8BIT);
-          quirc_data* qr_data = (quirc_data*)heap_caps_malloc(sizeof(quirc_data), MALLOC_CAP_8BIT);
+        if (xQueueSend(qrImageQueue, &imageData, 0) == pdTRUE) {
+          Serial.println("📤 Image sent to QR processing task");
           
-          if (qr_code && qr_data) {
-            for (int i = 0; i < qr_count; i++) {
-              Serial.printf("Processing QR code %d/%d...\n", i+1, qr_count);
-              
-              quirc_extract(qr_recognizer, i, qr_code);
-              quirc_decode_error_t err = quirc_decode(qr_code, qr_data);
-              
-              if (err == QUIRC_SUCCESS) {
-                Serial.printf("\n🎯 QR CODE DETECTED #%d:\n", i+1);
-                Serial.printf("Content: %s\n", qr_data->payload);
-                Serial.printf("Length: %d chars\n", strlen((char*)qr_data->payload));
-                Serial.println("====================");
-                break; // Process only first successful QR code to avoid further stack issues
-              } else {
-                Serial.printf("QR decode error: %s\n", quirc_strerror(err));
-              }
+          // Check for result (non-blocking with short timeout)
+          QRResult result;
+          if (xQueueReceive(qrResultQueue, &result, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (result.found) {
+              Serial.printf("\n🎯 QR CODE DETECTED (Attempt #%d):\n", result.attempt_number);
+              Serial.printf("Content: %s\n", result.content);
+              Serial.printf("Length: %d chars\n", strlen(result.content));
+              Serial.println("====================");
+            } else {
+              Serial.println("No QR codes detected by processing task");
             }
           } else {
-            Serial.println("⚠️ Failed to allocate memory for QR processing");
+            Serial.println("⏳ QR processing task is still working...");
           }
-          
-          // Clean up heap allocations
-          if (qr_code) free(qr_code);
-          if (qr_data) free(qr_data);
         } else {
-          Serial.println("No QR codes detected in grayscale image");
+          Serial.println("⚠️ Failed to send image to QR processing task (queue full)");
+          free(grayscale_buffer); // Clean up if we couldn't send
         }
         
         esp_camera_fb_return(fb);
