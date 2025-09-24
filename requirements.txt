@@ -1,0 +1,5 @@
+# QR Code Generator Requirements
+# Install these packages before running the QR code generator
+
+qrcode[pil]==7.4.2
+Pillow>=9.0.0

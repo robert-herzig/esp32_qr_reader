@@ -1,0 +1,85 @@
+# Python virtual environment
+venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Old sketch folder (video web server)
+Sketch_07.2_As_VideoWebServer/
+
+# Arduino IDE files
+*.hex
+*.elf
+*.map
+*.lst
+*.sym
+*.lss
+*.eep
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*~
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*.bak
+*.orig
+
+# Log files
+*.log
+logs/
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Node modules (if any web interface is added later)
+node_modules/
+
+# Compiled libraries
+*.a
+*.so
+*.lib
+*.dll
+
+# SD card debug images (binary files can be large)
+*.raw
+*.bin
+debug_gray_*.raw
+qr_debug_*.bin
