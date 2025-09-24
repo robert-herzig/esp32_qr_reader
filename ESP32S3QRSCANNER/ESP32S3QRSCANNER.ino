@@ -62,13 +62,15 @@ void qrProcessingTask(void *pvParameters) {
     if (xQueueReceive(qrImageQueue, &imageData, portMAX_DELAY) == pdTRUE) {
       Serial.printf("QR Task: Processing image %d (%dx%d)\n", 
                    imageData.attempt_number, imageData.width, imageData.height);
+      Serial.printf("QR Task Stack: %d bytes free\n", 
+                   uxTaskGetStackHighWaterMark(NULL));
       
       // Initialize result
       result.found = false;
       result.attempt_number = imageData.attempt_number;
       strcpy(result.content, "");
       
-      // Create temporary quirc instance for this task
+      // Create temporary quirc instance for this task (heap allocation)
       struct quirc *task_qr_recognizer = quirc_new();
       if (task_qr_recognizer && 
           quirc_resize(task_qr_recognizer, imageData.width, imageData.height) >= 0) {
@@ -81,19 +83,37 @@ void qrProcessingTask(void *pvParameters) {
           
           // Look for QR codes
           int qr_count = quirc_count(task_qr_recognizer);
+          Serial.printf("QR Task: Found %d potential QR codes\n", qr_count);
+          
           if (qr_count > 0) {
-            // Process first QR code found
-            quirc_code qr_code;
-            quirc_data qr_data;
+            // Allocate QR structures on heap to minimize stack usage
+            quirc_code *qr_code = (quirc_code*)heap_caps_malloc(sizeof(quirc_code), MALLOC_CAP_8BIT);
+            quirc_data *qr_data = (quirc_data*)heap_caps_malloc(sizeof(quirc_data), MALLOC_CAP_8BIT);
             
-            quirc_extract(task_qr_recognizer, 0, &qr_code);
-            quirc_decode_error_t err = quirc_decode(&qr_code, &qr_data);
-            
-            if (err == QUIRC_SUCCESS) {
-              result.found = true;
-              strncpy(result.content, (char*)qr_data.payload, sizeof(result.content) - 1);
-              result.content[sizeof(result.content) - 1] = '\0';  // Ensure null termination
+            if (qr_code && qr_data) {
+              Serial.printf("QR Task Stack after heap alloc: %d bytes free\n", 
+                           uxTaskGetStackHighWaterMark(NULL));
+              
+              quirc_extract(task_qr_recognizer, 0, qr_code);
+              quirc_decode_error_t err = quirc_decode(qr_code, qr_data);
+              
+              if (err == QUIRC_SUCCESS) {
+                result.found = true;
+                strncpy(result.content, (char*)qr_data->payload, sizeof(result.content) - 1);
+                result.content[sizeof(result.content) - 1] = '\0';  // Ensure null termination
+                Serial.printf("QR Task: Successfully decoded QR code\n");
+              } else {
+                Serial.printf("QR Task: Decode error - %s\n", quirc_strerror(err));
+              }
+            } else {
+              Serial.println("QR Task: Failed to allocate QR structures");
             }
+            
+            // Clean up heap allocations
+            if (qr_code) free(qr_code);
+            if (qr_data) free(qr_data);
+          } else {
+            Serial.println("QR Task: No QR codes detected");
           }
         }
         quirc_destroy(task_qr_recognizer);
@@ -290,11 +310,11 @@ void setup() {
     return;
   }
   
-  // Create QR processing task with large stack (16KB)
+  // Create QR processing task with very large stack (48KB - quirc needs a lot of stack)
   BaseType_t taskResult = xTaskCreatePinnedToCore(
     qrProcessingTask,      // Task function
     "QRProcessing",        // Task name
-    16384,                 // Stack size (16KB - much larger than default 4KB)
+    49152,                 // Stack size (48KB - quirc library needs substantial stack space)
     NULL,                  // Task parameters
     1,                     // Task priority
     &qrProcessingTaskHandle, // Task handle
@@ -306,7 +326,7 @@ void setup() {
     return;
   }
   
-  Serial.println("✓ QR processing task created with 16KB stack");
+  Serial.println("✓ QR processing task created with 48KB stack");
   Serial.println("🚀 Setup complete! Ready to test QR detection...");
   Serial.println("📋 Place a QR code in front of the camera!");
   Serial.println();
