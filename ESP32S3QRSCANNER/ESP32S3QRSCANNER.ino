@@ -51,6 +51,57 @@ struct QRResult {
 
 // Function declarations
 void qrProcessingTask(void *pvParameters);
+void enhanceImageForQR(uint8_t* image, int width, int height);
+
+// Image enhancement function to improve QR code detection
+void enhanceImageForQR(uint8_t* image, int width, int height) {
+  int total_pixels = width * height;
+  
+  // Find current min/max for histogram stretching
+  uint8_t min_val = 255, max_val = 0;
+  for (int i = 0; i < total_pixels; i++) {
+    if (image[i] < min_val) min_val = image[i];
+    if (image[i] > max_val) max_val = image[i];
+  }
+  
+  // Apply histogram stretching for better contrast
+  if (max_val > min_val) {
+    float scale = 255.0f / (max_val - min_val);
+    for (int i = 0; i < total_pixels; i++) {
+      int enhanced = (int)((image[i] - min_val) * scale);
+      image[i] = (uint8_t)(enhanced > 255 ? 255 : (enhanced < 0 ? 0 : enhanced));
+    }
+    Serial.printf("QR Task: Enhanced contrast - stretched %d-%d to 0-255\n", min_val, max_val);
+  }
+  
+  // Apply median filter to reduce noise (simple 3x3 filter on edges)
+  // This helps clean up noisy pixels that can cause ECC failures
+  for (int y = 1; y < height - 1; y++) {
+    for (int x = 1; x < width - 1; x++) {
+      int idx = y * width + x;
+      
+      // Get 3x3 neighborhood
+      uint8_t neighbors[9] = {
+        image[(y-1)*width + (x-1)], image[(y-1)*width + x], image[(y-1)*width + (x+1)],
+        image[y*width + (x-1)],     image[y*width + x],     image[y*width + (x+1)],
+        image[(y+1)*width + (x-1)], image[(y+1)*width + x], image[(y+1)*width + (x+1)]
+      };
+      
+      // Simple median (sort and take middle value)
+      for (int i = 0; i < 8; i++) {
+        for (int j = i + 1; j < 9; j++) {
+          if (neighbors[i] > neighbors[j]) {
+            uint8_t temp = neighbors[i];
+            neighbors[i] = neighbors[j];
+            neighbors[j] = temp;
+          }
+        }
+      }
+      image[idx] = neighbors[4]; // median value
+    }
+  }
+  Serial.println("QR Task: Applied noise reduction filter");
+}
 
 // QR Processing Task - runs with large stack to handle quirc library
 void qrProcessingTask(void *pvParameters) {
@@ -79,6 +130,10 @@ void qrProcessingTask(void *pvParameters) {
         uint8_t *qr_image = quirc_begin(task_qr_recognizer, NULL, NULL);
         if (qr_image) {
           memcpy(qr_image, imageData.image_data, imageData.width * imageData.height);
+          
+          // Enhance image quality for better QR detection
+          enhanceImageForQR(qr_image, imageData.width, imageData.height);
+          
           quirc_end(task_qr_recognizer);
           
           // Look for QR codes
@@ -187,22 +242,27 @@ void cameraInit() {
 
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
-    // Conservative sensor settings to prevent DMA overflow
+    // Optimized sensor settings for QR code detection
     s->set_vflip(s, 1);          // flip it back
-    s->set_brightness(s, 0);     // Normal brightness
-    s->set_contrast(s, 0);       // Normal contrast  
-    s->set_saturation(s, 0);     // Not relevant for grayscale, but set anyway
-    s->set_gainceiling(s, (gainceiling_t)0);  // Lowest gain ceiling
-    s->set_quality(s, 12);       // Not used for grayscale
+    s->set_brightness(s, 1);     // Slightly higher brightness for QR codes
+    s->set_contrast(s, 2);       // Increase contrast for better black/white distinction
+    s->set_saturation(s, 0);     // Not relevant for QR detection
+    s->set_gainceiling(s, (gainceiling_t)2);  // Higher gain ceiling for better low-light performance
+    s->set_quality(s, 10);       // Higher quality JPEG (lower compression)
     s->set_colorbar(s, 0);       // Disable color bar
     s->set_whitebal(s, 1);       // Enable auto white balance
-    s->set_gain_ctrl(s, 1);      // Enable auto gain control
-    s->set_exposure_ctrl(s, 1);  // Enable auto exposure
+    s->set_gain_ctrl(s, 1);      // Enable auto gain control for varying lighting
+    s->set_exposure_ctrl(s, 1);  // Enable auto exposure for optimal brightness
     s->set_hmirror(s, 0);        // No horizontal mirror
     s->set_wpc(s, 1);            // Enable white pixel correction
-    s->set_bpc(s, 0);            // Disable black pixel correction (can cause issues)
-    s->set_lenc(s, 1);           // Enable lens correction
+    s->set_bpc(s, 1);            // Enable black pixel correction for cleaner blacks
+    s->set_lenc(s, 1);           // Enable lens correction for sharper edges
     s->set_dcw(s, 1);            // Enable DCW (downsize)
+    
+    Serial.println("✓ Camera settings optimized for QR code detection");
+    Serial.println("  - Higher contrast and brightness for better black/white distinction");
+    Serial.println("  - Higher quality JPEG compression");
+    Serial.println("  - Enhanced pixel correction for cleaner QR patterns");
     Serial.println("✓ Conservative sensor settings applied for stability");
   } else {
     Serial.println("WARNING: Could not configure sensor settings");
